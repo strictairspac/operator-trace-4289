@@ -7,6 +7,7 @@ class Trace(Base):
  dataset_id=Column(Integer,ForeignKey('datasets.id'),nullable=False)
  plan_id=Column(Integer,ForeignKey('plans.id'),nullable=False)
  status=Column(String(20),default='queued',nullable=False)
+ zone_version=Column(Integer,nullable=False,default=0)
  result=Column(JSON,nullable=True)
  error=Column(String(1000),nullable=True)
  snapshot=Column(JSON,nullable=False)

@@ -19,7 +19,7 @@ while True:
    if not row or row.status!='queued':continue
    row.status='running';snapshot=row.snapshot;s.commit()
   try:
-   result=execute(snapshot['dataset'],snapshot['plan']['steps'])
+   result=execute(snapshot['dataset'],snapshot['plan']['steps'],snapshot.get('zone_intervals'),snapshot.get('zone_version',0))
    with Session() as s:r=s.get(Trace,run_id);r.result=result;r.status='completed';s.commit()
    log('worker','trace.completed',str(run_id))
   except Exception as exc:

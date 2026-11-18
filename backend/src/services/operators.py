@@ -2,10 +2,12 @@
 from collections import defaultdict
 from decimal import Decimal
 import time,json,hashlib,math
-from src.constants.enums import OPERATORS
+from src.constants.enums import OPERATORS,ZONE_MODES
+from src.utils.times import ts_key
 MAX_ROWS=10000
 READING_FIELDS={'sensor_id','value','recorded_at'}
 SENSOR_FIELDS={'sensor_id','zone','device_type'}
+JOIN_BASE={'op':'hash_join','right':'sensors','left_key':'sensor_id','right_key':'sensor_id'}
 def validate_steps(steps):
  if not isinstance(steps,list) or not 1<=len(steps)<=6:raise ValueError('计划须包含1至6个算子')
  fields=set();grouped=False
@@ -21,9 +23,11 @@ def validate_steps(steps):
    if step['compare']!='eq' and (step['field'] not in ('sensor_id','value','count','sum','avg') or not isinstance(step['value'],(int,float)) or not math.isfinite(step['value'])):raise ValueError('范围筛选只接受数值字段和有限数值')
    if not isinstance(step['value'],(str,int,float)) or isinstance(step['value'],bool) or (isinstance(step['value'],float) and not math.isfinite(step['value'])):raise ValueError('filter值只接受文本或数值')
   elif op=='hash_join':
-   if grouped or not READING_FIELDS.issubset(fields) or step!={'op':'hash_join','right':'sensors','left_key':'sensor_id','right_key':'sensor_id'}:raise ValueError('hash_join仅支持分组前readings与sensors按sensor_id内连接')
+   if grouped or not READING_FIELDS.issubset(fields) or any(step.get(k)!=v for k,v in JOIN_BASE.items()) or set(step)-set(JOIN_BASE)-{'zone_mode'}:raise ValueError('hash_join仅支持分组前readings与sensors按sensor_id内连接')
+   mode=step.get('zone_mode','current')
+   if mode not in ZONE_MODES:raise ValueError('zone_mode仅支持current（传感器表现行区域）或sample_time（按采样时刻归属）')
    if 'zone' in fields:raise ValueError('一个计划只允许一次连接')
-   fields|=SENSOR_FIELDS
+   fields|=SENSOR_FIELDS if mode=='current' else {'zone'}
   elif op=='group':
    if set(step)!={'op','keys','measure','aggregate'} or grouped:raise ValueError('仅允许一次group，参数为keys/measure/aggregate')
    keys=step['keys']
@@ -33,8 +37,8 @@ def validate_steps(steps):
  return steps
 
 def checksum(rows):return hashlib.sha256(json.dumps(rows,sort_keys=True,ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
-def execute(dataset,steps):
- validate_steps(steps);rows=[];trace=[];total_started=time.perf_counter();reads=0
+def execute(dataset,steps,intervals=None,zone_version=0):
+ validate_steps(steps);rows=[];trace=[];total_started=time.perf_counter();reads=0;intervals=intervals or []
  for step in steps:
   before=len(rows);started=time.perf_counter();detail={}
   if step['op']=='scan':
@@ -48,15 +52,29 @@ def execute(dataset,steps):
     return v>=value if cmp=='gte' else v<=value
    reads+=len(rows);rows=[r for r in rows if match(r)];detail={'predicate':step,'removed_rows':before-len(rows)}
   elif step['op']=='hash_join':
-   buckets=defaultdict(list)
-   for sensor in dataset['sensors']:buckets[sensor['sensor_id']].append(sensor)
-   joined=[];probes=0
-   for row in rows:
-    probes+=1
-    for sensor in buckets.get(row['sensor_id'],[]):
-     joined.append({**row,**sensor})
+   mode=step.get('zone_mode','current')
+   if mode=='current':
+    buckets=defaultdict(list)
+    for sensor in dataset['sensors']:buckets[sensor['sensor_id']].append(sensor)
+    joined=[];probes=0
+    for row in rows:
+     probes+=1
+     for sensor in buckets.get(row['sensor_id'],[]):
+      joined.append({**row,**sensor})
+      if len(joined)>MAX_ROWS:raise ValueError('连接结果超过10000行，请缩小输入；未保存部分结果')
+    reads+=len(rows)+len(dataset['sensors']);rows=joined;detail={'build_rows':len(dataset['sensors']),'hash_buckets':len(buckets),'probe_rows':probes,'zone_mode':mode,'semantics':'inner join; duplicate right keys retain multiplicity'}
+   else:
+    buckets=defaultdict(list)
+    for iv in sorted(intervals,key=lambda x:(x['sensor_id'],x['valid_from'])):buckets[iv['sensor_id']].append(iv)
+    joined=[];probes=0;unmatched=0
+    for row in rows:
+     probes+=1;key=ts_key(row.get('recorded_at',''));hit=None
+     for iv in buckets.get(row['sensor_id'],[]):
+      if iv['valid_from']<=key<iv['valid_to']:hit=iv;break
+     if hit is None:unmatched+=1;continue
+     joined.append({**row,'zone':hit['zone']})
      if len(joined)>MAX_ROWS:raise ValueError('连接结果超过10000行，请缩小输入；未保存部分结果')
-   reads+=len(rows)+len(dataset['sensors']);rows=joined;detail={'build_rows':len(dataset['sensors']),'hash_buckets':len(buckets),'probe_rows':probes,'semantics':'inner join; duplicate right keys retain multiplicity'}
+    reads+=len(rows)+len(intervals);rows=joined;detail={'build_rows':len(intervals),'hash_buckets':len(buckets),'probe_rows':probes,'unmatched_rows':unmatched,'zone_mode':mode,'zone_version':zone_version,'semantics':'inner join on sensor_id; zone attributed by recorded_at within [valid_from,valid_to); readings without attribution dropped'}
   elif step['op']=='group':
    grouped=defaultdict(list);keys=step['keys'];agg=step['aggregate']
    for row in rows:grouped[tuple(row[k] for k in keys)].append(Decimal(str(row['value'])))
@@ -66,4 +84,4 @@ def execute(dataset,steps):
     rows.append({**dict(zip(keys,key)),agg:round(value,6) if isinstance(value,float) else value})
    rows.sort(key=lambda r:json.dumps(r,sort_keys=True,ensure_ascii=False));detail={'groups':len(rows),'aggregate':agg,'accumulator':'decimal from source string; rounded 6 decimals'}
   trace.append({'op':step['op'],'input_rows':before,'output_rows':len(rows),'duration_ms':round((time.perf_counter()-started)*1000,4),'detail':detail,'checksum':checksum(rows),'preview':rows[:5]})
- return {'operators':trace,'output':rows,'output_rows':len(rows),'checksum':checksum(rows),'row_visits':reads,'duration_ms':round((time.perf_counter()-total_started)*1000,4),'limits':{'max_readings':2000,'max_sensors':100,'max_join_rows':10000,'max_stages':6},'model':'Python teaching scan/filter/hash join/group engine; PostgreSQL persists business metadata only'}
+ return {'operators':trace,'output':rows,'output_rows':len(rows),'checksum':checksum(rows),'row_visits':reads,'zone_version':zone_version,'duration_ms':round((time.perf_counter()-total_started)*1000,4),'limits':{'max_readings':2000,'max_sensors':100,'max_join_rows':10000,'max_stages':6},'model':'Python teaching scan/filter/hash join/group engine; PostgreSQL persists business metadata only'}

@@ -5,7 +5,7 @@
 ## 场景与模块
 上游是设备可靠性课程的采样文件、传感器表和分析需求。过去在白板画算子、手动算中间行数，再把截图发给助教；重复键丢失、空结果误判、输入版本变化后无法复现实验是三个痛点。本站保存数据集与有界计划 DSL，worker 真执行并保存不可变快照/逐步摘要，下游讲师和同学只读复查。
 
-数据集录入/编辑、算子计划编排、执行队列、算子剖面/JSON导出四个业务页面；管理员有审计。三个实体 datasets / plans / traces 均贯穿数据库、模型、schema、service、controller、route、前端api/store/page。
+数据集录入/编辑、算子计划编排、执行队列、算子剖面/JSON导出四个业务页面；管理员有审计。三个实体 datasets / plans / traces 均贯穿数据库、模型、schema、service、controller、route、前端api/store/page。传感器调区后可在数据集页补登归属区间，hash_join 增加按采样时刻归属的连接方式。
 
 ## 启动
 ```sh
@@ -39,6 +39,11 @@ seed三账号、三个数据集（240行日班、空数据、重复右键）、�
 这是教学内核模型，不是PostgreSQL执行器剖面。PostgreSQL真实保存业务元数据；Python worker真实计算表扫描、数值/相等筛选、构建哈希桶与内连接、Decimal累积分组。右表重复键保留倍数，空集合输出空集合。分组avg/sum保留6位小数，输出按规范JSON排序，SHA-256使用排序key紧凑JSON UTF-8；相同输入和计划结果摘要相同。每步输出输入/输出行数、耗时、明细、前5行与checksum。scan 的 input_rows=0 表示从源读取，detail.scanned_rows为扫描源行数；row_visits是扫描/过滤/哈希构建与探测/聚合各步逻辑行访问总和，不代表物理I/O。
 
 DSL最多6步，首步仅scan readings；filter eq/gte/lte；hash_join仅readings.sensor_id=sensors.sensor_id且最多一次；group仅value的count/sum/avg。禁止eval、任意代码和任意SQL。最多100传感器、2000采样、10000连接输出行；超限失败，不保存部分结果。JSON非法、字段错误、非法算子、孤立引用、重复名有可恢复错误。任务使用Redis简单单消费者，进程崩溃后的running任务不自动重试，保留供人工复查后新建任务。
+
+## 调区归属（按采样时刻）
+传感器换区后，在数据集页或 `POST /api/datasets/{id}/zones` 整批补登归属区间：区间含起点、不含终点（`[valid_from,valid_to)`，ISO 8601，落库前规范化）。登记按数据集行锁串行化：批内或撞上已生效区间（同一传感器相交）整批拒绝（409），互不相交的并发登记都生效，每接受一批归属版本+1。`GET /api/datasets/{id}/zones` 查当前版本与全部区间。
+
+hash_join 默认 `zone_mode:"current"`（原连接方式，按传感器表现行区域）；加 `"zone_mode":"sample_time"` 则按采样时刻找归属：每条reading以recorded_at匹配同传感器唯一覆盖区间，找不到归属的采样不参加连接（detail.unmatched_rows计数），该模式只补充zone字段。执行在受理时把归属版本与区间钉入快照（traces.zone_version + snapshot.zone_intervals）：补登后的新剖面用修正后的归属，旧剖面重跑（`POST /api/traces/{id}/rerun`，另存新轨迹）保持原来的分组结果，也不覆盖存档。剖面页从受理到完成都展示采用的归属版本。
 
 ## 技术、目录与本地开发
 Python3.11 / FastAPI / SQLAlchemy / psycopg / Redis / PostgreSQL16；原生 HTML/CSS/JS ES modules / nginx1.27。五服务frontend/backend/worker/db/redis均健康探针，命名卷数据库/Redis/共享产物。DB/Redis健康后启动backend，backend健康后启worker/frontend。
